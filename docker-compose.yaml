@@ -1,0 +1,204 @@
+x-kong-config:
+  &kong-env
+  KONG_DATABASE: ${KONG_DATABASE:-postgres}
+  KONG_PG_DATABASE: ${KONG_PG_DATABASE:-kong}
+  KONG_PG_HOST: db
+  KONG_PG_USER: ${KONG_PG_USER:-kong}
+  KONG_PG_PASSWORD_FILE: /run/secrets/kong_postgres_password
+x-openfga-config:
+  &openfga-env
+  OPENFGA_DATASTORE_ENGINE: ${KONG_DATABASE:-postgres}
+  OPENFGA_DATASTORE_URI: postgres://${KONG_PG_USER:-kong}:${KONG_PG_PASSWORD:-Passw0rd}@db:5432/${KONG_PG_DATABASE:-kong}?sslmode=disable
+  OPENFGA_DATASTORE_MAX_OPEN_CONNS: 100 #see postgres container
+  OPENFGA_PLAYGROUND_ENABLED: true
+  OPENFGA_HTTP_ADDR: 0.0.0.0:8080
+services:
+  kong-migrations:
+    image: "${KONG_DOCKER_TAG:-kong:latest}"
+    container_name: dkq-km
+    command: kong migrations bootstrap
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      <<: *kong-env
+    secrets:
+      - kong_postgres_password
+    networks:
+      - localdev
+    restart: on-failure
+  kong-migrations-up:
+    container_name: dkq-kmu
+    image: "${KONG_DOCKER_TAG:-kong:latest}"
+    command: kong migrations up && kong migrations finish
+    depends_on:
+      kong-migrations:
+        condition: service_completed_successfully
+    environment:
+      <<: *kong-env
+    secrets:
+      - kong_postgres_password
+    networks:
+      - localdev
+    restart: on-failure
+  db:
+    image: postgres:14
+    container_name: dkq-db
+    environment:
+      POSTGRES_DB: ${KONG_PG_DATABASE:-kong}
+      POSTGRES_USER: ${KONG_PG_USER:-kong}
+      POSTGRES_PASSWORD_FILE: /run/secrets/kong_postgres_password
+    secrets:
+      - kong_postgres_password
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "pg_isready",
+          "-d",
+          "${KONG_PG_DATABASE:-kong}",
+          "-U",
+          "${KONG_PG_USER:-kong}"
+        ]
+      interval: 10s
+      timeout: 10s
+      start_period: 10s
+      retries: 3
+    restart: on-failure
+    stdin_open: true
+    tty: true
+    networks:
+      - localdev
+    volumes:
+      - kong_data:/var/lib/postgresql/data
+  api:
+    container_name: dkq-api
+    image: "dkq/api:latest"
+    build:
+      context: docker/api
+    ports: 
+      - "8082:8080"
+    networks:
+      localdev:
+        aliases:
+          - api.localdev
+    volumes: 
+      - ./docker/api/server/data/:/app/data
+  terraform:
+    container_name: dkq-terraform
+    image: "dkq/terraform:latest"
+    build:
+      context: docker/terraform
+    working_dir: /mnt/init
+    entrypoint: /bin/sh -c "source /init-kong.sh"
+    networks:
+      - localdev
+    volumes:
+      - terraform:/mnt/terraform:rw
+    depends_on:
+      kong:
+        condition: service_healthy
+      openfga:
+        condition: service_healthy
+    profiles:
+      - init
+  kong:
+    container_name: dkq-kong
+    image: "${KONG_DOCKER_TAG:-dqk/kong:latest}"
+    build:
+      context: docker/kong
+    user: "${KONG_USER:-kong}"
+    env_file: .env/kong/.env
+    environment:
+      <<: *kong-env
+      KONG_ADMIN_ACCESS_LOG: /dev/stdout
+      KONG_ADMIN_ERROR_LOG: /dev/stderr
+      KONG_PROXY_LISTEN: "${KONG_PROXY_LISTEN:-0.0.0.0:8000}"
+      KONG_ADMIN_LISTEN: "${KONG_ADMIN_LISTEN:-0.0.0.0:8001}"
+      KONG_ADMIN_GUI_LISTEN: "${KONG_ADMIN_GUI_LISTEN:-0.0.0.0:8002}"
+      KONG_PROXY_ACCESS_LOG: /dev/stdout
+      KONG_PROXY_ERROR_LOG: /dev/stderr
+      KONG_PREFIX: ${KONG_PREFIX:-/var/run/kong}
+      KONG_DECLARATIVE_CONFIG: "/opt/kong/kong.yaml"
+    secrets:
+      - kong_postgres_password
+    networks:
+      - localdev
+    ports:
+      - "${KONG_INBOUND_PROXY_LISTEN:-0.0.0.0}:8000:8000/tcp"
+      - "${KONG_INBOUND_SSL_PROXY_LISTEN:-0.0.0.0}:8443:8443/tcp"
+      - "127.0.0.1:8001:8001/tcp"
+      - "127.0.0.1:8444:8444/tcp"
+      - "127.0.0.1:8002:8002/tcp"
+    healthcheck:
+      test: [ "CMD", "kong", "health" ]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    restart: on-failure:5
+    read_only: true
+    volumes:
+      - kong_prefix_vol:${KONG_PREFIX:-/var/run/kong}
+      - kong_tmp_vol:/tmp
+      - ./config:/opt/kong
+    security_opt:
+      - no-new-privileges
+    depends_on:
+      kong-migrations-up:
+        condition: service_completed_successfully
+      openfga:
+        condition: service_healthy
+  openfga_migrate:
+    depends_on:
+      db:
+        condition: service_healthy
+    image: openfga/openfga:latest
+    container_name: migrate
+    environment:
+      <<: *openfga-env
+    command: migrate
+    networks:
+      - localdev
+  openfga:
+    depends_on:
+      openfga_migrate:
+        condition: service_completed_successfully
+    image: openfga/openfga:latest
+    container_name: openfga
+    command: run
+    environment:
+      <<: *openfga-env
+    networks:
+      - localdev
+    ports:
+      - "8080:8080" #http
+      - "8081:8081" #grpc
+      - "3000:3000" #playground
+      - "2112:2112" #prometheus metrics
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "/usr/local/bin/grpc_health_probe",
+          "-addr=openfga:8081"
+        ]
+      interval: 5s
+      timeout: 30s
+      retries: 3
+secrets:
+  kong_postgres_password:
+    file: .env/POSTGRES_PASSWORD
+volumes:
+  kong_data: {}
+  kong_prefix_vol:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+  kong_tmp_vol:
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+  terraform:
+  certs:
+networks:
+  localdev:
