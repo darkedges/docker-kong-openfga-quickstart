@@ -1,4 +1,4 @@
-# docker kong quickstart
+# docker kong openfga quickstart
 
 ## Init
 
@@ -14,12 +14,15 @@ docker compose up terraform
 
 ## Access Admin UI
 
-<http://kong.7f000001.nip.io:8002>
-
+<http://localhost:8002>
 
 ## Access API
 
-<http://kong.7f000001.nip.io:8000/provider/api/records>
+<http://localhost:8000/provider/api/records>
+
+## Access openFGA Playground
+
+<http://localhost:3000/playground>
 
 ## Cleanup
 
